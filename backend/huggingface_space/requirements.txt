@@ -1,0 +1,8 @@
+# Hugging Face installs gradio itself (from the Space's README sdk_version), which also brings
+# fastapi, uvicorn, httpx and python-multipart — so they are not pinned here to avoid conflicts.
+onnxruntime>=1.18
+opencv-python-headless>=4.10
+numpy>=1.26
+psycopg[binary]>=3.2
+psycopg-pool>=3.2
+tzdata
