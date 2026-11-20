@@ -424,42 +424,58 @@ def capture_token(session_id: int, user: dict = Depends(current_user)):
 
 @app.post("/api/sessions/{session_id}/photos")
 def upload_class_photo(session_id: int, request: Request, image: UploadFile = File(...),
-                       capture_token: str = Form(...), lat: str | None = Form(None), lng: str | None = Form(None),
+                       capture_token: str | None = Form(None), lat: str | None = Form(None), lng: str | None = Form(None),
                        accuracy: str | None = Form(None), user: dict = Depends(current_user)):
     data = image.file.read(config.MAX_UPLOAD_BYTES + 1)
     ip = client_ip(request)
+    uploaded = not capture_token  # a saved photo chosen from the device, not a live capture
     with get_db() as conn:
         session, subject = get_session(conn, session_id, user)
         check_session_open(session)
         if config.ALLOWED_IP_PREFIXES and not any(ip.startswith(p) for p in config.ALLOWED_IP_PREFIXES):
             raise HTTPException(403, "Uploads are only allowed from the college network")
-        # live-capture token: burn it now, in its own committed transaction
-        tok = conn.execute(
-            """UPDATE capture_tokens SET used = true
-               WHERE token=%s AND session_id=%s AND used = false
-               RETURNING expires_at < now() AS expired""", (capture_token, session_id)).fetchone()
-    if not tok:
-        raise HTTPException(403, "Invalid capture. Photos must be taken with the live camera.")
-    if tok["expired"]:
-        raise HTTPException(403, "Camera session expired. Reopen the camera and capture again.")
+        if uploaded and not config.ALLOW_PHOTO_UPLOAD:
+            raise HTTPException(403, "Photo upload is turned off. Use the live camera.")
+        tok = None
+        if not uploaded:
+            # live-capture token: burn it now, in its own committed transaction
+            tok = conn.execute(
+                """UPDATE capture_tokens SET used = true
+                   WHERE token=%s AND session_id=%s AND used = false
+                   RETURNING expires_at < now() AS expired""", (capture_token, session_id)).fetchone()
+    if not uploaded:
+        if not tok:
+            raise HTTPException(403, "Invalid capture. Photos must be taken with the live camera.")
+        if tok["expired"]:
+            raise HTTPException(403, "Camera session expired. Reopen the camera and capture again.")
 
     if len(data) > config.MAX_UPLOAD_BYTES:
         raise HTTPException(413, "Image too large")
-    if not data.startswith(b"\xff\xd8"):
-        raise HTTPException(400, "Only live JPEG captures are accepted")
-    if has_exif(data):
-        raise HTTPException(400, "This looks like a saved/gallery photo (camera metadata found). "
-                                 "Use the live camera in the app.")
+    if not uploaded:
+        if not data.startswith(b"\xff\xd8"):
+            raise HTTPException(400, "Only live JPEG captures are accepted")
+        if has_exif(data):
+            raise HTTPException(400, "This looks like a saved/gallery photo (camera metadata found). "
+                                     "Use the live camera in the app.")
     img = decode_image(data)
     if img is None:
-        raise HTTPException(400, "Could not read the image")
+        raise HTTPException(400, "Could not read the image. Use a JPG or PNG photo.")
     if max(img.shape[:2]) < config.MIN_PHOTO_SIDE_PX:
         raise HTTPException(400, f"Image resolution too low (need at least {config.MIN_PHOTO_SIDE_PX}px)")
     sha = hashlib.sha256(data).hexdigest()
 
+    if uploaded:  # store a clean JPEG (also drops EXIF/location metadata from the file)
+        stored = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])[1].tobytes()
+    else:
+        stored = data
+
     flat, flng, facc = parse_float(lat), parse_float(lng), parse_float(accuracy)
     distance = None
-    if flat is None or flng is None:
+    if uploaded:
+        # the teacher's position says nothing about where a saved photo was taken: record only
+        if flat is None or flng is None or not (-90 <= flat <= 90 and -180 <= flng <= 180):
+            flat = flng = facc = None
+    elif flat is None or flng is None:
         if config.REQUIRE_LOCATION:
             raise HTTPException(400, "Location is required. Allow location access in the browser.")
         flat = flng = facc = None
@@ -486,10 +502,10 @@ def upload_class_photo(session_id: int, request: Request, image: UploadFile = Fi
 
         now = local_now()
         base = f"{session_id}/{now.strftime('%Y%m%d_%H%M%S')}_{sha[:10]}"
-        loc = f"{flat:.5f},{flng:.5f}" if flat is not None else "no GPS"
+        loc = "uploaded photo" if uploaded else (f"{flat:.5f},{flng:.5f}" if flat is not None else "no GPS")
         banner = f"{subject['code']} {subject['section']} | {now.strftime('%Y-%m-%d %H:%M:%S %Z')} | {loc}"
         ok, ann = cv2.imencode(".jpg", annotate(img, faces, matches, banner), [cv2.IMWRITE_JPEG_QUALITY, 85])
-        supa.upload(config.PHOTO_BUCKET, f"{base}.jpg", data)
+        supa.upload(config.PHOTO_BUCKET, f"{base}.jpg", stored)
         supa.upload(config.PHOTO_BUCKET, f"{base}_annotated.jpg", ann.tobytes())
 
         photo_id = conn.execute(
@@ -504,7 +520,8 @@ def upload_class_photo(session_id: int, request: Request, image: UploadFile = Fi
                 [(photo_id, [float(v) for v in f.box], float(f.score), m["roll_no"], m["similarity"], m["status"])
                  for f, m in zip(faces, matches)])
         n = {k: sum(m["status"] == k for m in matches) for k in ("matched", "review", "unknown")}
-        audit(conn, user["id"], "upload_photo", session_id=session_id, photo_id=photo_id, faces=len(faces), **n)
+        audit(conn, user["id"], "upload_photo", session_id=session_id, photo_id=photo_id, faces=len(faces),
+              mode="upload" if uploaded else "live", **n)
         summary = session_summary(conn, session, subject)
         summary["last_photo"] = {"id": photo_id, "faces": len(faces), **n}
         return summary
@@ -601,7 +618,8 @@ def student_report(roll_no: str, user: dict = Depends(current_user)):
 @app.get("/api/config")
 def public_config():
     return {"match_threshold": config.MATCH_THRESHOLD, "review_threshold": config.REVIEW_THRESHOLD,
-            "require_location": config.REQUIRE_LOCATION, "capture_token_ttl": config.CAPTURE_TOKEN_TTL_SEC}
+            "require_location": config.REQUIRE_LOCATION, "capture_token_ttl": config.CAPTURE_TOKEN_TTL_SEC,
+            "allow_photo_upload": config.ALLOW_PHOTO_UPLOAD}
 
 
 @app.get("/api/health")

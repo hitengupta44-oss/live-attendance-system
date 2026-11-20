@@ -1,7 +1,7 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
-import { Camera, CameraOff, LocateFixed, MapPinOff, RefreshCw, ShieldCheck, X } from "lucide-react";
+import { Camera, CameraOff, ImageUp, LocateFixed, MapPinOff, RefreshCw, ShieldCheck, X } from "lucide-react";
 import { api, type SessionSummary } from "@/lib/api";
 import { useToast } from "./toast";
 import { Button } from "./ui";
@@ -9,9 +9,9 @@ import { Button } from "./ui";
 type Geo = { lat: number; lng: number; acc: number } | null;
 
 /**
- * Live-only capture. There is deliberately no file input anywhere: the only way to
- * submit a photo is a frame grabbed from the camera stream, together with a
- * short-lived single-use token the server issued while the camera was open.
+ * Live capture: a frame grabbed from the camera stream plus a short-lived single-use token
+ * the server issued while the camera was open. If the backend allows it (ALLOW_PHOTO_UPLOAD),
+ * teachers can also upload a saved class photo; those are labelled "uploaded photo" on the evidence.
  */
 export function LiveCamera({ sessionId, onResult }: { sessionId: number; onResult: (s: SessionSummary) => void }) {
   const toast = useToast();
@@ -28,8 +28,13 @@ export function LiveCamera({ sessionId, onResult }: { sessionId: number; onResul
   const [geo, setGeo] = useState<Geo>(null);
   const [geoErr, setGeoErr] = useState<string | null>(null);
   const [secure, setSecure] = useState(true);
+  const [allowUpload, setAllowUpload] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => { setSecure(window.isSecureContext && !!navigator.mediaDevices?.getUserMedia); }, []);
+  useEffect(() => {
+    api<{ allow_photo_upload?: boolean }>("/api/config").then((c) => setAllowUpload(!!c.allow_photo_upload)).catch(() => {});
+  }, []);
 
   const newToken = useCallback(async () => {
     const t = await api<{ token: string; expires_in: number }>(`/api/sessions/${sessionId}/capture-token`, { method: "POST" });
@@ -80,6 +85,30 @@ export function LiveCamera({ sessionId, onResult }: { sessionId: number; onResul
     } finally { setOpening(false); }
   }
 
+  async function send(blob: Blob, filename: string, token: string | null) {
+    const fd = new FormData();
+    fd.append("image", blob, filename);
+    if (token) fd.append("capture_token", token);
+    if (geo) { fd.append("lat", String(geo.lat)); fd.append("lng", String(geo.lng)); fd.append("accuracy", String(geo.acc)); }
+    const r = await api<SessionSummary>(`/api/sessions/${sessionId}/photos`, { body: fd });
+    const lp = r.last_photo!;
+    toast(`${lp.faces} face${lp.faces === 1 ? "" : "s"} found · ${lp.matched} recognised${lp.review ? ` · ${lp.review} to confirm` : ""}${lp.unknown ? ` · ${lp.unknown} unknown` : ""}`);
+    onResult(r);
+  }
+
+  async function uploadFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) { toast("Choose a photo (JPG or PNG)", "err"); return; }
+    const preview = URL.createObjectURL(file);
+    setFrozen(preview);
+    setBusy(true);
+    try { await send(file, file.name, null); }
+    catch (err) { toast((err as Error).message, "err"); }
+    finally { setBusy(false); setFrozen(null); URL.revokeObjectURL(preview); }
+  }
+
   async function capture() {
     const v = videoRef.current;
     if (!v || !v.videoWidth) { toast("Camera is still starting…", "err"); return; }
@@ -90,14 +119,8 @@ export function LiveCamera({ sessionId, onResult }: { sessionId: number; onResul
     setBusy(true);
     try {
       const blob = await new Promise<Blob>((res, rej) => canvas.toBlob((b) => (b ? res(b) : rej(new Error("Capture failed"))), "image/jpeg", 0.92));
-      const fd = new FormData();
-      fd.append("image", blob, "live.jpg");
-      fd.append("capture_token", tokenRef.current ?? "");
-      if (geo) { fd.append("lat", String(geo.lat)); fd.append("lng", String(geo.lng)); fd.append("accuracy", String(geo.acc)); }
-      const r = await api<SessionSummary>(`/api/sessions/${sessionId}/photos`, { body: fd });
-      const lp = r.last_photo!;
-      toast(`${lp.faces} face${lp.faces === 1 ? "" : "s"} found · ${lp.matched} recognised${lp.review ? ` · ${lp.review} to confirm` : ""}${lp.unknown ? ` · ${lp.unknown} unknown` : ""}`);
-      onResult(r);
+      if (!tokenRef.current) throw new Error("Camera is still starting…");
+      await send(blob, "live.jpg", tokenRef.current);
     } catch (e) {
       toast((e as Error).message, "err");
     } finally {
@@ -122,19 +145,27 @@ export function LiveCamera({ sessionId, onResult }: { sessionId: number; onResul
         <div className="absolute inset-x-0 bottom-24 z-[5] text-center text-sm font-medium drop-shadow">Matching faces to the class list…</div>
       </>}
 
-      {!live && (
+      <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp" className="hidden" onChange={uploadFile} />
+
+      {!live && !busy && (
         <div className="absolute inset-0 z-[1] flex flex-col items-center justify-center gap-4 px-8 pt-10 text-center"
           style={{ backgroundImage: "radial-gradient(rgba(255,255,255,.07) 1px, transparent 1px)", backgroundSize: "18px 18px" }}>
           {secure ? <>
             <div className="grid size-16 place-items-center rounded-full bg-white/10"><Camera className="size-7" /></div>
             <div>
               <div className="font-display text-[28px] leading-tight">Ready when the class is.</div>
-              <p className="mx-auto mt-1 max-w-xs text-sm text-white/60">Only live camera photos are accepted. Gallery uploads are disabled.</p>
+              <p className="mx-auto mt-1 max-w-xs text-sm text-white/60">
+                {allowUpload ? "Take a live photo of the class, or upload one you already took." : "Only live camera photos are accepted. Gallery uploads are disabled."}
+              </p>
             </div>
-            <Button variant="primary" size="lg" loading={opening} onClick={() => open()}><Camera className="size-4" /> Open camera</Button>
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              <Button variant="primary" size="lg" loading={opening} onClick={() => open()}><Camera className="size-4" /> Open camera</Button>
+              {allowUpload && <Button size="lg" onClick={() => fileRef.current?.click()}><ImageUp className="size-4" /> Upload photo</Button>}
+            </div>
           </> : <>
             <CameraOff className="size-8 text-white/60" />
             <p className="max-w-xs text-sm text-white/70">The camera needs a secure (https) connection. Open SmartAttend from its https:// address.</p>
+            {allowUpload && <Button size="lg" onClick={() => fileRef.current?.click()}><ImageUp className="size-4" /> Upload photo</Button>}
           </>}
         </div>
       )}

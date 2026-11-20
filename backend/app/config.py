@@ -50,6 +50,8 @@ ALLOWED_ORIGINS = [o.strip().rstrip("/") for o in os.getenv("ALLOWED_ORIGINS", "
 
 # Load the 30 demo students + 4 subjects on start-up if the database has no students yet.
 SEED_DEMO = _env_bool("SEED_DEMO", False)
+# Password for the 4 demo teacher accounts the seed creates (Space secret). Unset = no demo teachers.
+DEMO_TEACHER_PASSWORD = os.getenv("DEMO_TEACHER_PASSWORD", "").strip()
 
 # Time zone used for the time stamp burned into evidence photos.
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
@@ -62,6 +64,9 @@ REVIEW_THRESHOLD = _env_float("REVIEW_THRESHOLD", 0.30)  # >= : teacher must con
 CAPTURE_TOKEN_TTL_SEC = int(os.getenv("CAPTURE_TOKEN_TTL_SEC", 120))
 LECTURE_MAX_MINUTES = int(os.getenv("LECTURE_MAX_MINUTES", 120))
 REQUIRE_LOCATION = _env_bool("REQUIRE_LOCATION", True)
+# Let teachers upload a saved class photo instead of using the live camera.
+# Uploads skip the live-capture and location checks, so set to 0 for strict live-only mode.
+ALLOW_PHOTO_UPLOAD = _env_bool("ALLOW_PHOTO_UPLOAD", True)
 MAX_GPS_ACCURACY_M = _env_float("MAX_GPS_ACCURACY_M", 200)
 ALLOWED_IP_PREFIXES = [p.strip() for p in os.getenv("ALLOWED_IP_PREFIXES", "").split(",") if p.strip()]
 MIN_PHOTO_SIDE_PX = int(os.getenv("MIN_PHOTO_SIDE_PX", 640))
